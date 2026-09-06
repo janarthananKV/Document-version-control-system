@@ -83,8 +83,16 @@ class RepoState:
             return None
         data = json.loads(meta.read_text("utf-8"))
         versions = [VersionEntry(**v) for v in data["versions"]]
-        return RepoState(document_type=data["document_type"],
-                         snapshot_interval=data.get("snapshot_interval", 5),
+        document_type = data["document_type"]
+        snapshot_interval = data.get("snapshot_interval", 5)
+        if document_type not in {"docx", "pdf"}:
+            raise ValueError(f"Unsupported document type in metadata: {document_type}")
+        if snapshot_interval < 1:
+            raise ValueError("snapshot_interval in metadata must be at least 1")
+        if not versions or [v.version for v in versions] != list(range(1, len(versions) + 1)):
+            raise ValueError("Repository metadata contains non-contiguous versions")
+        return RepoState(document_type=document_type,
+                         snapshot_interval=snapshot_interval,
                          versions=versions)
 
     def save(self, path: Path) -> None:
@@ -99,6 +107,10 @@ class RepoState:
 # Core DVCS logic
 class DVCS:
     def __init__(self, file_path: str, doc_type: str, snapshot_interval: int = 5):
+        if doc_type not in {"docx", "pdf"}:
+            raise ValueError("doc_type must be 'docx' or 'pdf'")
+        if snapshot_interval < 1:
+            raise ValueError("snapshot_interval must be at least 1")
         self.file_path = Path(file_path)
         self.doc_type = doc_type
         self.repo_path = repo_dir_for(self.file_path)
@@ -124,25 +136,26 @@ class DVCS:
 
     # Add version
     def add(self, message: str) -> None:
-        self._require_initialized()
+        state = self._require_initialized()
+        if state.document_type != self.doc_type:
+            raise ValueError(
+                f"Repository contains {state.document_type}, not {self.doc_type}"
+            )
         data = self.file_path.read_bytes()
-        next_ver = self.state.versions[-1].version + 1
+        next_ver = state.versions[-1].version + 1
         # Decide snapshot vs delta
-        if (next_ver - 1) % self.state.snapshot_interval == 0:
+        if (next_ver - 1) % state.snapshot_interval == 0:
             # make a snapshot
             vfile = self._version_file(next_ver, snapshot=True)
             vfile.write_bytes(data)
             entry = VersionEntry(version=next_ver, kind="snapshot", file=vfile.name,
                                  message=message, created_at=now_iso())
-            self.state.versions.append(entry)
-            self.state.save(self.repo_path)
+            state.versions.append(entry)
+            state.save(self.repo_path)
             print(f"Added snapshot v{next_ver}")
             return
 
         # else make a delta from nearest base snapshot
-        base_idx, base_entry = self._nearest_snapshot_before(next_ver)
-        base_bytes = (self.repo_path / base_entry.file).read_bytes()
-
         # Reconstruct prior version (next_ver-1) to use as delta source
         prior_bytes = self._reconstruct_bytes(next_ver - 1)
 
@@ -170,8 +183,8 @@ class DVCS:
                     created_at=now_iso(),
                     base_version=next_ver - 1   # <-- just pass it directly
                 )
-                self.state.versions.append(entry)
-                self.state.save(self.repo_path)
+                state.versions.append(entry)
+                state.save(self.repo_path)
                 print(f"Added delta v{next_ver} (xdelta3)")
                 return
             except subprocess.CalledProcessError as e:
@@ -187,8 +200,8 @@ class DVCS:
         vfile.write_bytes(data)
         entry = VersionEntry(version=next_ver, kind="snapshot", file=vfile.name,
                              message=message + " (fallback snapshot)", created_at=now_iso())
-        self.state.versions.append(entry)
-        self.state.save(self.repo_path)
+        state.versions.append(entry)
+        state.save(self.repo_path)
         print(f"Added snapshot v{next_ver} (fallback)")
 
     # Get / Reconstruct
@@ -196,6 +209,7 @@ class DVCS:
         self._require_initialized()
         out_path = Path(output)
         bytes_ = self._reconstruct_bytes(version)
+        ensure_dir(out_path.parent)
         out_path.write_bytes(bytes_)
         print(f"Wrote v{version} -> {out_path}")
 
@@ -203,42 +217,40 @@ class DVCS:
     def revert(self, version: int) -> None:
         self._require_initialized()
         bytes_ = self._reconstruct_bytes(version)
-        self.file_path.write_bytes(bytes_)
+        temp_path = self.file_path.with_name(f".{self.file_path.name}.revert.tmp")
+        temp_path.write_bytes(bytes_)
+        temp_path.replace(self.file_path)
         print(f"Reverted {self.file_path.name} to v{version}")
+
+    def get_version_bytes(self, version: int) -> bytes:
+        self._require_initialized()
+        return self._reconstruct_bytes(version)
 
     # History
     def history(self) -> None:
-        self._require_initialized()
-        print(f"History for {self.file_path.name} (type={self.state.document_type}):")
-        for v in self.state.versions:
+        state = self._require_initialized()
+        print(f"History for {self.file_path.name} (type={state.document_type}):")
+        for v in state.versions:
             base = f" base={v.base_version}" if v.base_version else ""
             print(f"  v{v.version:04d} [{v.kind}]{base}  {v.created_at}  {v.message}")
 
     # DOCX human-readable diff
     def show_diff(self, v1: int, v2: int) -> None:
-        self._require_initialized()
-        if self.state.document_type != "docx":
+        state = self._require_initialized()
+        if state.document_type != "docx":
             print("Human-readable diff is only supported for DOCX.")
             return
-
-        def extract_text_from_docx_bytes(docx_bytes):
-            texts = []
-            with zipfile.ZipFile(BytesIO(docx_bytes)) as z:
-                with z.open("word/document.xml") as f:
-                    tree = ET.parse(f)
-                    root = tree.getroot()
-                    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-                    for t in root.findall(".//w:t", ns):
-                        texts.append(t.text or "")
-            return texts
 
         # reconstruct both versions
         b1 = self._reconstruct_bytes(v1)
         b2 = self._reconstruct_bytes(v2)
 
-        # extract human-readable text
-        x1 = extract_text_from_docx_bytes(b1)
-        x2 = extract_text_from_docx_bytes(b2)
+        def normalized_xml_lines(docx_bytes):
+            xml = normalize_docx_xml(extract_docx_xml(docx_bytes))
+            return re.sub(r"><", ">\n<", xml).splitlines()
+
+        x1 = normalized_xml_lines(b1)
+        x2 = normalized_xml_lines(b2)
 
         # run line-based diff
         diff = difflib.unified_diff(
@@ -247,15 +259,16 @@ class DVCS:
         text = "\n".join(diff)
 
         if not text.strip():
-            print("No significant textual changes detected.")
+            print("No significant XML changes detected.")
         else:
             print(text)
 
 
     # Internals
     def _reconstruct_bytes(self, target_version: int) -> bytes:
-        if target_version < 1 or target_version > self.state.versions[-1].version:
-            raise ValueError(f"version must be in [1, {self.state.versions[-1].version}]")
+        state = self._require_initialized()
+        if target_version < 1 or target_version > state.versions[-1].version:
+            raise ValueError(f"version must be in [1, {state.versions[-1].version}]")
         # Find nearest snapshot at or before target
         snap_idx, snap_entry = self._nearest_snapshot_at_or_before(target_version)
         data = (self.repo_path / snap_entry.file).read_bytes()
@@ -288,23 +301,26 @@ class DVCS:
         return data
 
     def _nearest_snapshot_before(self, next_ver: int) -> Tuple[int, VersionEntry]:
+        state = self._require_initialized()
         # Find nearest snapshot strictly before next_ver
-        for i in range(len(self.state.versions) - 1, -1, -1):
-            v = self.state.versions[i]
+        for i in range(len(state.versions) - 1, -1, -1):
+            v = state.versions[i]
             if v.version < next_ver and v.kind == "snapshot":
                 return i, v
         # Should never happen because v1 is a snapshot
         raise RuntimeError("No snapshot found before requested version.")
 
     def _nearest_snapshot_at_or_before(self, ver: int) -> Tuple[int, VersionEntry]:
-        for i in range(len(self.state.versions) - 1, -1, -1):
-            v = self.state.versions[i]
+        state = self._require_initialized()
+        for i in range(len(state.versions) - 1, -1, -1):
+            v = state.versions[i]
             if v.version <= ver and v.kind == "snapshot":
                 return i, v
         raise RuntimeError("No snapshot found at or before requested version.")
 
     def _entry_for(self, ver: int) -> VersionEntry:
-        for v in self.state.versions:
+        state = self._require_initialized()
+        for v in state.versions:
             if v.version == ver:
                 return v
         raise KeyError(f"No entry for version {ver}")
@@ -314,12 +330,23 @@ class DVCS:
         name = f"v{ver:04d}{suffix}"
         return self.repo_path / name
 
-    def _require_initialized(self) -> None:
+    def _require_initialized(self) -> RepoState:
         if self.state is None:
             raise RuntimeError("Repository not initialized. Run `init` first.")
+        return self.state
 
 
 # CLI
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
 def main():
     parser = argparse.ArgumentParser(description="Hybrid DVCS for DOCX/PDF (snapshots + binary deltas + DOCX diff viewer)")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -328,7 +355,7 @@ def main():
     p_init.add_argument("file", help="Path to DOCX/PDF")
     p_init.add_argument("-t", "--type", choices=["docx", "pdf"], required=True)
     p_init.add_argument("-m", "--message", default="Initial version")
-    p_init.add_argument("--interval", type=int, default=5, help="Snapshot interval (default: 5)")
+    p_init.add_argument("--interval", type=positive_int, default=5, help="Snapshot interval (default: 5)")
 
     p_add = sub.add_parser("add", help="Add current file contents as a new version")
     p_add.add_argument("file")

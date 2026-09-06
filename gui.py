@@ -236,7 +236,8 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
-from dvcs import DVCS, repo_dir_for
+import tempfile
+from dvcs import DVCS, RepoState, repo_dir_for
 
 
 from docx import Document
@@ -374,10 +375,8 @@ class DVCS_UI:
             self.file_path = path
             self.file_label.config(text=self.file_path)
             rdir = repo_dir_for(self.file_path)
-            if rdir.exists():
-                self.dvcs = DVCS(self.file_path, "docx")
-            else:
-                self.dvcs = None
+            state = RepoState.load(rdir)
+            self.dvcs = DVCS(self.file_path, state.document_type) if state else None
             self.populate_versions()
 
     def init_repo(self):
@@ -393,7 +392,7 @@ class DVCS_UI:
             messagebox.showerror("Error", str(e))
 
     def populate_versions(self):
-        if not self.dvcs:
+        if not self.dvcs or not self.dvcs.state:
             return
         versions = [v.version for v in self.dvcs.state.versions]
         self.version_combo['values'] = versions
@@ -430,7 +429,7 @@ class DVCS_UI:
             messagebox.showerror("Error", str(e))
 
     def show_history(self):
-        if not self.dvcs:
+        if not self.dvcs or not self.dvcs.state:
             messagebox.showerror("Error", "No document selected or repo not initialized")
             return
         history_window = tk.Toplevel(self.root)
@@ -490,10 +489,22 @@ class DVCS_UI:
             return
 
         try:
-            path_v1 = self.dvcs.get_version_file(v1)
-            path_v2 = self.dvcs.get_version_file(v2)
-
-            diff = diff_texts_with_media(path_v1, path_v2)
+            with tempfile.TemporaryDirectory(prefix="dvcs_compare_") as temp_dir:
+                path_v1 = tempfile.NamedTemporaryFile(
+                    dir=temp_dir, suffix=".docx", delete=False
+                )
+                path_v2 = tempfile.NamedTemporaryFile(
+                    dir=temp_dir, suffix=".docx", delete=False
+                )
+                try:
+                    path_v1.write(self.dvcs.get_version_bytes(v1))
+                    path_v2.write(self.dvcs.get_version_bytes(v2))
+                    path_v1.close()
+                    path_v2.close()
+                    diff = diff_texts_with_media(path_v1.name, path_v2.name)
+                finally:
+                    path_v1.close()
+                    path_v2.close()
 
             diff_window = tk.Toplevel(self.root)
             diff_window.title(f"Diff: v{v1} vs v{v2}")

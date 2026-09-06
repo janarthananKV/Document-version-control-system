@@ -5,14 +5,14 @@ from io import BytesIO
 from docx import Document
 from docx.oxml.ns import qn
 from deepdiff import DeepDiff
-import google.generativeai as genai
+from google import genai
 
 from dvcs import DVCS  # import your DVCS class
 from image_utils import extract_image_metadata, compare_images_detailed
 
 # --- API key management helpers (avoid typing every time) ---
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_KEY_FILE = os.path.join(_BASE_DIR, ".dvcs_gemini_key")
+_DEFAULT_KEY_FILE = os.path.join(os.path.expanduser("~"), ".dvcs_gemini_key")
 
 def resolve_gemini_key(provided_key: str | None) -> str | None:
     """Return an API key using precedence: provided > env > keyfile.
@@ -35,13 +35,10 @@ def resolve_gemini_key(provided_key: str | None) -> str | None:
 
 def save_gemini_key(key: str) -> None:
     """Persist API key to the default key file in the user's home directory."""
-    try:
-        os.makedirs(os.path.dirname(_DEFAULT_KEY_FILE), exist_ok=True)
-    except Exception:
-        # Parent may already exist or be the home itself
-        pass
+    os.makedirs(os.path.dirname(_DEFAULT_KEY_FILE), exist_ok=True)
     with open(_DEFAULT_KEY_FILE, "w", encoding="utf-8") as f:
         f.write((key or "").strip())
+    os.chmod(_DEFAULT_KEY_FILE, 0o600)
 
 def extract_pages_by_breaks(docx_bytes):
     """
@@ -170,7 +167,7 @@ def extract_doc_structure(docx_bytes):
 def diff_docx_bytes(v1_bytes, v2_bytes):
     doc1 = extract_doc_structure(v1_bytes)
     doc2 = extract_doc_structure(v2_bytes)
-    return DeepDiff(doc1, doc2, ignore_order=True).to_dict()
+    return DeepDiff(doc1, doc2).to_dict()
 
 
 def summarize_snapshot(doc_name: str, v1: int, v2: int,
@@ -179,8 +176,8 @@ def summarize_snapshot(doc_name: str, v1: int, v2: int,
     dvcs = DVCS(doc_name, "docx")
 
     # Reconstruct bytes
-    b1 = dvcs._reconstruct_bytes(v1)
-    b2 = dvcs._reconstruct_bytes(v2)
+    b1 = dvcs.get_version_bytes(v1)
+    b2 = dvcs.get_version_bytes(v2)
 
     # ===============================
     # 1. IMAGE ANALYSIS (your part)
@@ -196,11 +193,12 @@ def summarize_snapshot(doc_name: str, v1: int, v2: int,
             f"Images in v{v2}: {len(images_v2)}\n"
             f"Added: {len(image_changes['added'])}\n"
             f"Removed: {len(image_changes['removed'])}\n"
+            f"Modified: {len(image_changes['modified'])}\n"
             f"Unchanged: {len(image_changes['unchanged'])}\n"
         )
     except Exception as e:
         summary_text = f"\n[Image Analysis Error: {e}]\n"
-        image_changes = {'added': [], 'removed': [], 'unchanged': []}
+        image_changes = {'added': [], 'removed': [], 'modified': [], 'unchanged': []}
 
     # ======================================
     # 2. FULL DOCX STRUCTURE DIFF (NEW PART)
@@ -217,17 +215,14 @@ def summarize_snapshot(doc_name: str, v1: int, v2: int,
     # ========================================================
     if use_llm:
         effective_key = resolve_gemini_key(llm_api_key)
-        if effective_key:
-            try:
-                genai.configure(api_key=effective_key)
-            except Exception:
-                pass
 
         image_context = ""
-        if image_changes["added"] or image_changes["removed"]:
+        if (image_changes["added"] or image_changes["removed"]
+                or image_changes["modified"]):
             image_context = (
                 f"\nImage changes: {len(image_changes['added'])} added, "
-                f"{len(image_changes['removed'])} removed."
+                f"{len(image_changes['removed'])} removed, "
+                f"{len(image_changes['modified'])} modified."
             )
 
         prompt = (
@@ -244,8 +239,11 @@ def summarize_snapshot(doc_name: str, v1: int, v2: int,
         )
 
         try:
-            model = genai.GenerativeModel("gemini-2.5-flash")
-            response = model.generate_content(prompt)
+            client = genai.Client(api_key=effective_key)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=prompt,
+            )
             summary_text += f"\n=== Document Summary ===\n{response.text}\n"
         except Exception as e:
             summary_text += f"\n[Gemini API ERROR: {e}]\nPrompt Preview:\n{prompt[:2000]}\n"
