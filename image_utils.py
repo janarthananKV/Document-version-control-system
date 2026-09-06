@@ -6,6 +6,7 @@ from io import BytesIO
 import tempfile
 import subprocess
 import os
+import posixpath
 from docx import Document
 from docx.oxml.ns import qn
 from docx.shared import RGBColor
@@ -13,9 +14,12 @@ from docx.enum.text import WD_COLOR_INDEX
 import xml.etree.ElementTree as ET
 from PIL import Image
 try:
-    import fitz  # PyMuPDF
+    import pymupdf as fitz
 except Exception:  # optional runtime dependency
-    fitz = None
+    try:
+        import fitz  # type: ignore  # legacy PyMuPDF import
+    except Exception:
+        fitz = None
 import io
 import difflib
 
@@ -49,25 +53,7 @@ def extract_image_metadata(docx_bytes):
             }
             images.append(img_info)
             
-        # Also check for inline shapes (python-docx method)
-        try:
-            doc = Document(BytesIO(docx_bytes))
-            for i, shape in enumerate(doc.inline_shapes):
-                if hasattr(shape, 'image'):
-                    # This is a more reliable way to get actual image data
-                    img_info = {
-                        'shape_index': i,
-                        'width': shape.width,
-                        'height': shape.height,
-                        'type': str(shape.type),
-                        'position': f"inline_shape_{i}",
-                        'content_hash': _get_inline_shape_hash(shape),
-                        'size_bytes': _get_inline_shape_size(shape)
-                    }
-                    images.append(img_info)
-        except Exception as e:
-            print(f"Warning: Could not extract inline shapes: {e}")
-    
+
     # Try to enrich with exact page numbers via rendered PDF if available
     try:
         images = _enrich_positions_with_pdf_pages(images, docx_bytes)
@@ -87,13 +73,15 @@ def _extract_embedded_images(zip_file, doc_root, ns):
         
         for rel in rels_root.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
             rel_type = rel.get("Type")
-            if "image" in rel_type.lower():
-                target = rel.get("Target")
+            if rel_type and "image" in rel_type.lower():
+                target = (rel.get("Target") or "").lstrip("/")
                 rel_id = rel.get("Id")
                 
                 try:
                     # Read the actual image file
-                    img_path = f"word/{target}"
+                    img_path = posixpath.normpath(posixpath.join("word", target))
+                    if img_path == ".." or img_path.startswith("../"):
+                        continue
                     img_data = zip_file.read(img_path)
                     images.append((rel_id, img_data))
                 except KeyError:
@@ -240,7 +228,7 @@ def _enrich_positions_with_pdf_pages(images, docx_bytes):
                         if dims and dims.get('width') == width and dims.get('height') == height:
                             candidates.append(img)
                     if len(candidates) == 1:
-                        candidates[0]['position'] = f"page_{page_index+1}"
+                        candidates[0]['page'] = page_index + 1
         finally:
             doc.close()
         return images
@@ -268,24 +256,41 @@ def compare_images_detailed(current_images, other_images):
         'unchanged': []
     }
     
-    # Create lookup dictionaries
-    current_dict = {img['content_hash']: img for img in current_images}
-    other_dict = {img['content_hash']: img for img in other_images}
-    
-    # Find added images
-    for hash_val, img in other_dict.items():
-        if hash_val not in current_dict:
-            changes['added'].append(img)
-    
-    # Find removed images
-    for hash_val, img in current_dict.items():
-        if hash_val not in other_dict:
-            changes['removed'].append(img)
-    
-    # Find unchanged images
-    for hash_val in current_dict:
-        if hash_val in other_dict:
-            changes['unchanged'].append(current_dict[hash_val])
+    remaining_current = list(current_images)
+    remaining_other = list(other_images)
+
+    # Match identical content first, so moving an unchanged image is not a change.
+    for current in list(remaining_current):
+        match = next(
+            (other for other in remaining_other
+             if other['content_hash'] == current['content_hash']),
+            None,
+        )
+        if match is not None:
+            changes['unchanged'].append(current)
+            remaining_current.remove(current)
+            remaining_other.remove(match)
+
+    def image_position(image):
+        position = image.get('position')
+        if position and position != 'unknown_position':
+            return position
+        return image.get('rel_id')
+
+    # Pair remaining images at the same document position as modifications.
+    for current in list(remaining_current):
+        match = next(
+            (other for other in remaining_other
+             if image_position(other) == image_position(current)),
+            None,
+        )
+        if match is not None:
+            changes['modified'].append({'before': current, 'after': match})
+            remaining_current.remove(current)
+            remaining_other.remove(match)
+
+    changes['removed'].extend(remaining_current)
+    changes['added'].extend(remaining_other)
     
     return changes
 
@@ -377,6 +382,20 @@ def generate_enhanced_highlighted_copy(current_bytes, other_bytes, output_path="
             else:
                 run = p.add_run(f"✗ Removed: Image ({img['width']}x{img['height']}) - {img['size_bytes']} bytes")
             run.font.color.rgb = RGBColor(255, 0, 0)
+
+    if image_changes['modified']:
+        new_doc.add_heading('Modified Images', level=2)
+        for change in image_changes['modified']:
+            before = change['before']
+            after = change['after']
+            before_dims = before['dimensions']
+            after_dims = after['dimensions']
+            p = new_doc.add_paragraph()
+            run = p.add_run(
+                f"~ Modified: {before['format']} {before_dims['width']}x{before_dims['height']} "
+                f"to {after['format']} {after_dims['width']}x{after_dims['height']}"
+            )
+            run.font.color.rgb = RGBColor(255, 140, 0)
     
     if image_changes['unchanged']:
         new_doc.add_heading('Unchanged Images', level=2)
@@ -390,11 +409,21 @@ def generate_enhanced_highlighted_copy(current_bytes, other_bytes, output_path="
     
     # Summary
     summary_para = new_doc.add_paragraph()
-    summary_text = f"Summary: {len(image_changes['added'])} added, {len(image_changes['removed'])} removed, {len(image_changes['unchanged'])} unchanged images"
+    summary_text = (
+        f"Summary: {len(image_changes['added'])} added, "
+        f"{len(image_changes['removed'])} removed, "
+        f"{len(image_changes['modified'])} modified, "
+        f"{len(image_changes['unchanged'])} unchanged images"
+    )
     summary_para.add_run(summary_text)
     
     new_doc.save(output_path)
     print(f"[OK] Enhanced highlighted copy saved: {output_path}")
-    print(f"Image changes: {len(image_changes['added'])} added, {len(image_changes['removed'])} removed, {len(image_changes['unchanged'])} unchanged")
+    print(
+        f"Image changes: {len(image_changes['added'])} added, "
+        f"{len(image_changes['removed'])} removed, "
+        f"{len(image_changes['modified'])} modified, "
+        f"{len(image_changes['unchanged'])} unchanged"
+    )
     
     return image_changes

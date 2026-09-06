@@ -1,2 +1,5 @@
 .dvcs_gemini_key
+GEMINI_API_KEY
+.venv/
 __pycache__
+.env
